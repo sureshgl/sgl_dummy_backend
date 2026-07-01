@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dummy-srt-platform-plugin"
+version = "0.1.0"
+description = "Dummy SRT platform plugin for testing and development"
+authors = [{name = "SureshGL"}]
+requires-python = ">=3.8"
+dependencies = [
+    "psutil",
+]
+
+[project.entry-points."sglang.srt.platforms"]
+dummy = "dummy_srt_platform_plugin:activate"
+
+[tool.setuptools]
+packages = {find = {where = ["src"]}}

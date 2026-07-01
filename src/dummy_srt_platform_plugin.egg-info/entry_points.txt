@@ -1,0 +1,2 @@
+[sglang.srt.platforms]
+dummy = dummy_srt_platform_plugin:activate
