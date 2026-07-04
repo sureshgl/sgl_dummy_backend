@@ -5,15 +5,25 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dummy-srt-platform-plugin"
 version = "0.1.0"
-description = "Dummy SRT platform plugin for testing and development"
-authors = [{name = "SureshGL"}]
-requires-python = ">=3.8"
+description = "CPU-compatible dummy SRT platform for SGLang, plus a general plugin that skips real model compute."
+requires-python = ">=3.9"
 dependencies = [
+    "torch",
     "psutil",
 ]
 
+# Plugin Type 1: Hardware Platform Plugin.
+# Registers DummySRTPlatform so SGLANG_PLATFORM=dummy (or auto-discovery,
+# if no other platform plugin is present) resolves current_platform to it.
 [project.entry-points."sglang.srt.platforms"]
 dummy = "dummy_srt_platform_plugin:activate"
+
+# Plugin Type 2: General Plugin.
+# Registers the ModelRunner.forward hook that skips real compute.
+
+[project.entry-points."sglang.srt.plugins"]
+dummy_forward = "dummy_srt_platform_plugin.fake_forward:register"
+dummy_load = "dummy_srt_platform_plugin.fake_load:register"
 
 [tool.setuptools]
 packages = {find = {where = ["src"]}}

@@ -73,4 +73,7 @@ class DummyPiecewiseBackend:
         Returns:
             Output tensor(s) from the graph execution.
         """
+        logger.debug(
+            "DummyPiecewiseBackend __call__ invoked with args: %s", args
+        )
         return self.compiled_graph_for_general_shape(*args)

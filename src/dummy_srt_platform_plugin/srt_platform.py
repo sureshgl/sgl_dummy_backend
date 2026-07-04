@@ -30,7 +30,9 @@ class DummySRTPlatform(SRTPlatform, DummyDeviceMixin):
         """Return the graph runner class for this platform."""
         # Use existing CPU graph runner
         from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
-        return CPUGraphRunner
+        from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+        return EagerRunner  # Use eager execution for CPU
+        # return CPUGraphRunner
 
     def get_mha_kv_pool_cls(self) -> type:
         """Return the MHA KV pool class for this platform."""

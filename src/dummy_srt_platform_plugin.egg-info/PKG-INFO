@@ -1,7 +1,0 @@
-Metadata-Version: 2.4
-Name: dummy-srt-platform-plugin
-Version: 0.1.0
-Summary: Dummy SRT platform plugin for testing and development
-Author: SureshGL
-Requires-Python: >=3.8
-Requires-Dist: psutil

@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# python ignore files
+dummy srt platform plugin.egg-info/
+src/dummy_srt_platform_plugin/__pycache__/

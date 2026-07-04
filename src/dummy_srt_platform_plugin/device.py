@@ -104,6 +104,7 @@ class DummyDeviceMixin(DeviceMixin):
 
     def get_torch_distributed_backend_str(self) -> str:
         """Return the torch.distributed backend string."""
+        logger.info("DummyDeviceMixin: get_torch_distributed_backend_str called → gloo")
         return "gloo"
 
     @classmethod
