@@ -26,10 +26,20 @@ and process_weights_after_loading are skipped entirely: both would try to
 write real values into tensors that have no storage to write into, and
 neither is needed since the values are never read.
 
+It also computes what those weights WOULD have cost in real VRAM -- sum of
+numel * element_size across every parameter, which meta tensors report
+correctly even with no real storage behind them -- and stashes that number
+directly on current_platform, where fake_memory.py's device.py-backed
+get_current_memory_usage() reads it back. Because SGLang's own
+ColumnParallelLinear/RowParallelLinear etc. compute their LOCAL shard size
+(divide(full_size, tp_size)) at __init__ time, this figure is automatically
+correct per-rank under tensor/expert parallelism too -- no extra sharding
+logic needed here.
+
 pyproject.toml addition:
 
     [project.entry-points."sglang.srt.plugins"]
-    dummy_weights = "dummy_srt_platform_plugin.fake_weights:register"
+    dummy_load = "dummy_srt_platform_plugin.fake_load:register"
 
 Requires: launch with --load-format dummy (this hook only patches
 DummyModelLoader; other load formats are untouched).
@@ -59,7 +69,8 @@ What's actually incompatible, verified against the source (not assumed):
     nn.Parameter tensors -- its process_weights_after_loading() calls
     .tolist() on them, which would fail on a meta tensor. Already covered
     by skipping process_weights_after_loading unconditionally; no separate
-    guard needed.
+    guard needed. This is also the code path a "Detected fp8 checkpoint"
+    (pre-quantized Hub repo, auto-detected from its own config.json) hits.
   - Speculative-decoding draft models and LoRA adapters load through
     separate paths (speculative_draft_load_format, lora_paths) that this
     hook does not touch -- they would still allocate real memory.
@@ -87,13 +98,13 @@ def register():
         _fake_load_model,
         HookType.AROUND,
     )
-    logger.info("dummy_weights plugin registered (meta-device model construction)")
+    logger.info("dummy_load plugin registered (meta-device model construction)")
 
 
 def _fake_load_model(original_fn, self, *, model_config, device_config):
-    logger.info("fake_load._fake_load_model: constructing model under torch.device('meta') instead of real device")
     """AROUND hook: never calls original_fn, so no real-sized weight tensor
     is ever allocated on the real device."""
+
     quant_config = _get_quantization_config(model_config, self.load_config)
     if quant_config is not None:
         # Not fatal -- construction still succeeds and nothing ever reads
@@ -104,14 +115,16 @@ def _fake_load_model(original_fn, self, *, model_config, device_config):
             "%s resolved to quant_config=%s (likely auto-detected from the "
             "checkpoint's own config.json). Quantization-specific weight "
             "post-processing will be skipped since weights are never "
-            "materialized under dummy_weights.",
+            "materialized under dummy_load.",
             model_config.model_path,
             type(quant_config).__name__,
         )
 
     with set_default_torch_dtype(model_config.dtype):
         with torch.device("meta"):
+            logger.info( "dummy_load: model_config.hf_config.moe_intermediate_size=%s", getattr(model_config.hf_config, "moe_intermediate_size", "MISSING"),)
             model = _initialize_model(model_config, self.load_config, quant_config)
+            
 
         # Deliberately NOT called, unlike the real DummyModelLoader:
         #   initialize_dummy_weights(model)     -- no storage to write into,
@@ -120,5 +133,48 @@ def _fake_load_model(original_fn, self, *, model_config, device_config):
         #                                           raise on a meta tensor
         #                                           (e.g. AMX repack on CPU)
         _post_load_weights(model)  # cheap flag-setting fixups; safe on meta
+
+    # Meta tensors have no data but correctly report shape/dtype -- this is
+    # exactly what real weights (in the real target dtype -- fp8, bf16,
+    # whatever the checkpoint actually is) would cost in VRAM, computed
+    # without ever allocating it. For TP/EP > 1, `model` here already holds
+    # only this rank's local shard (ColumnParallelLinear etc. size
+    # themselves at __init__ time), so this is automatically a per-rank
+    # figure, not the full model's.
+    from sglang.srt.platforms import current_platform
+
+    weight_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    from dummy_srt_platform_plugin.device import _resident_weight_bytes_holder
+    _resident_weight_bytes_holder["value"] = weight_bytes
+    from collections import Counter
+
+    bytes_by_dtype = Counter()
+    for p in model.parameters():
+        bytes_by_dtype[str(p.dtype)] += p.numel() * p.element_size()
+
+    for dtype, b in sorted(bytes_by_dtype.items(), key=lambda x: -x[1]):
+        logger.info("dummy_load: %s: %.2f GB", dtype, b / (1 << 30))
+        logger.info(
+            "dummy_load: this rank's (fake) weights would occupy %.2f GB of real "
+            "VRAM",
+            weight_bytes / (1 << 30),
+        )
+    for name, p in model.named_parameters():
+        if "layers.0." in name :
+            logger.info("dummy_load: %s shape=%s dtype=%s", name, tuple(p.shape), p.dtype)
+        
+    print("STASH SIDE __dict__:", current_platform.__dict__, flush=True)
+    logger.info(
+        "dummy_load DIAGNOSTIC: id(current_platform)=%s stashed=%s readback=%s",
+        id(current_platform),
+        weight_bytes,
+        current_platform.get_current_memory_usage(),
+    )
+    
+    import os
+    logger.info(
+        "dummy_load DIAGNOSTIC: pid=%s id(current_platform)=%s stashed=%s",
+        os.getpid(), id(current_platform), weight_bytes,
+    )
 
     return model.eval()

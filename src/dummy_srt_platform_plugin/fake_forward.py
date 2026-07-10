@@ -107,7 +107,7 @@ def register():
 def _fake_forward(original_fn, self, forward_batch, *args, **kwargs):
     """AROUND hook: never calls original_fn, so the real model.forward()
     (and every matmul inside it, on every PP stage) never runs."""
-    logger.info("dummy_forward plugin _fake_forward invoked, original_fn=%s, forward_batch=%s", original_fn, forward_batch)
+    # logger.info("dummy_forward plugin _fake_forward invoked, original_fn=%s, forward_batch=%s", original_fn, forward_batch)
     device = self.device
     num_tokens = forward_batch.input_ids.shape[0]
 

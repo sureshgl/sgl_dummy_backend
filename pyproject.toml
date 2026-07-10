@@ -5,11 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dummy-srt-platform-plugin"
 version = "0.1.0"
-description = "CPU-compatible dummy SRT platform for SGLang, plus a general plugin that skips real model compute."
+description = "CPU-compatible dummy SRT platform for SGLang, plus general plugins that skip real model compute, weight allocation, and emulate GPU-shaped memory."
 requires-python = ">=3.9"
 dependencies = [
     "torch",
-    "psutil",
 ]
 
 # Plugin Type 1: Hardware Platform Plugin.
@@ -18,12 +17,22 @@ dependencies = [
 [project.entry-points."sglang.srt.platforms"]
 dummy = "dummy_srt_platform_plugin:activate"
 
-# Plugin Type 2: General Plugin.
-# Registers the ModelRunner.forward hook that skips real compute.
+# Plugin Type 2: General Plugin(s).
+# dummy_forward -- skips real compute (ModelRunner.forward hook)
+# dummy_load    -- skips real weight allocation/randomization
+#                   (DummyModelLoader.load_model, meta-device construction)
+# dummy_memory  -- routes get_available_gpu_memory through current_platform
+#                   for device == "cpu", so it reports the emulated GPU's
+#                   memory instead of real host RAM
+# dummy_pynccl  -- disables PyNCCL communicator setup for the gloo backend,
+#                   needed once tp_size > 1 (GroupCoordinator otherwise
+#                   crashes trying torch.cuda.device("cpu"))
 
 [project.entry-points."sglang.srt.plugins"]
 dummy_forward = "dummy_srt_platform_plugin.fake_forward:register"
 dummy_load = "dummy_srt_platform_plugin.fake_load:register"
+dummy_memory = "dummy_srt_platform_plugin.fake_memory:register"
+dummy_pynccl = "dummy_srt_platform_plugin.fake_pynccl:register"
 
 [tool.setuptools]
 packages = {find = {where = ["src"]}}
