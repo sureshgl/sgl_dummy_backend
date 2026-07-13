@@ -1,81 +1,89 @@
 """
-General SGLang plugin: skip real model compute, return synthetic logits.
+General SGLang plugin: let the real forward pass run (on meta tensors,
+through torch.compile), then substitute real synthetic logits only at the
+very end.
 
-This is a *general plugin* (entry-point group "sglang.srt.plugins"),
-separate from the hardware-platform plugin (entry-point group
-"sglang.srt.platforms") that DummySRTPlatform already registers.
+Stage 1/2 vs Stage 3
+--------------------
+Stage 1/2: this hook intercepted ModelRunner.forward() BEFORE
+self.model.forward() was ever called -- the real model graph never
+executed, so DummyPiecewiseBackend (wired up via
+get_piecewise_backend_cls()) sat dormant, and there was no way to produce
+per-piece, per-shape latency: only one undifferentiated sleep for the
+whole forward pass.
 
-The platform interface (SRTPlatform / DeviceMixin) only controls WHICH
-classes handle graph running, KV pools, and allocators -- it never touches
-the forward-pass math itself. To skip the actual matmuls, hook the seam
-where ModelRunner.forward() would normally call into the real model.
+Stage 3 changes the posture from "skip the call" to "let it run, replace
+only the output": this hook now calls original_fn for real. That lets
+Dynamo actually trace the real model (on torch.device("meta") tensors, so
+no real memory is ever touched), hit real SGLang-authored split
+boundaries, and invoke DummyPiecewiseBackend per compiled piece and
+fake_attention.py's hooks for the real (always-eager, never-compiled)
+attention calls in between. Every piece -- including attention -- stays
+meta-in/meta-out, so the real forward pass produces a structurally correct
+but valueless (meta) result.
 
-Everything upstream and downstream of this hook stays real: tokenization,
-scheduling/batching, KV-cache bookkeeping, sampling, detokenization, and
-the HTTP/OpenAI-compatible response path all run exactly as they would in
-production. Only the transformer math is faked.
+That meta result isn't usable by the sampler, which needs real numbers.
+So after original_fn returns, this hook substitutes the same hash-based
+synthetic logits Stage 1/2 already used (_fake_logits_output, unchanged)
+in place of whatever the (meta) real forward produced -- but only on the
+PP rank that actually produces logits. Every other field on the real
+output (can_run_graph, expert_distribution_metrics,
+routed_experts_output, indexer_topk_output) is left exactly as the real
+forward pass set it, since Stage 3 no longer needs to reconstruct those by
+hand: the real code path already populated them correctly.
 
-Coverage across execution modes
---------------------------------
-TP (tensor parallel):   No extra code needed. Each TP rank runs in its own
-    scheduler subprocess (engine.py spawns one mp.Process per tp_rank), and
-    load_plugins() runs independently in every subprocess, so this hook is
-    applied on every rank automatically. Correctness caveat: real TP relies
-    on collectives to keep logits identical across ranks before sampling.
-    Since this hook skips all real compute (including those collectives),
-    only use DUMMY_FORWARD_MODE="hash" or "fixed" when tp_size > 1 --
-    both are derived from batch metadata that is already identical across
-    ranks. DUMMY_FORWARD_MODE="random" draws independently per process and
-    WILL desync ranks (each would sample a different "next" token, corrupting
-    KV-cache consistency across ranks).
+PP (pipeline parallel) is simpler under Stage 3 than Stage 1/2
+-----------------------------------------------------------------
+Stage 1/2 hand-built a zero-filled PPProxyTensors for intermediate PP
+stages, because the real model never ran and nothing else would have
+produced hidden states to hand to the next stage. Stage 3 doesn't need
+that anymore: the real (meta) forward pass already produces a real
+PPProxyTensors object with meta hidden-state tensors in it, via the same
+real code path a genuine GPU deployment would use -- and the next PP
+stage's real (meta) forward consumes those exactly as it would on a real
+GPU. So intermediate PP stages need no special-casing at all here: only
+the last-rank stage's logits get substituted with real (non-meta) values,
+since sampling -- the first place real numbers are actually required --
+only happens after the last PP stage.
 
-DP (data parallel):    No extra code needed. Each DP replica is also an
-    independent run_scheduler_process subprocess with its own plugin load,
-    and replicas never need to agree with each other (they serve disjoint
-    requests), so "random" mode is safe here even though it isn't for TP.
-
-PP (pipeline parallel): Handled explicitly below. Only the last PP stage
-    produces LogitsProcessorOutput; every earlier stage produces
-    PPProxyTensors (a dict of hidden-state tensors) to hand to the next
-    stage. A hook that always returns fake logits would break intermediate
-    stages, so this hook checks self.pp_group.is_last_rank and returns a
-    zero-filled PPProxyTensors({"hidden_states": ..., "residual": ...}) on
-    non-last stages instead.
-
-dllm (diffusion LLM):  No extra hook needed -- the dllm algorithms
-    (sglang/srt/dllm/algorithm/*.py) call model_runner.forward() directly,
-    in a loop, so this hook intercepts every one of those calls too.
-    The only wrinkle: dllm reads logits from `logits_output.full_logits`
-    (shape [num_tokens_in_block, vocab_size]), not `next_token_logits`
-    (shape [batch_size, vocab_size]) which the normal AR sampler uses.
-    This hook fills both fields so it works whether or not dllm is active,
-    with no mode detection required.
+dllm (diffusion LLM): unchanged from Stage 1/2 -- this hook still
+intercepts every model_runner.forward() call the dllm algorithms make in
+their loop, and _fake_logits_output still fills both full_logits and
+next_token_logits so it works whether or not dllm is active.
 
 Install alongside dummy_srt_platform_plugin, add the entry point below,
 and launch with --load-format dummy so no real checkpoint needs to be
 downloaded or read (the model config is still used, so vocab size /
-hidden size / layer counts / KV pool sizing stay correct).
+hidden size / layer counts / KV pool sizing stay correct). For Stage 3
+latency numbers to reflect real per-piece/per-attention-call timing,
+also launch with --cuda-graph-backend-prefill tc_piecewise (defaulted by
+DummySRTPlatform.apply_server_args_defaults, see srt_platform.py) so the
+real torch.compile/Dynamo piecewise pipeline actually runs.
 
 pyproject.toml addition:
 
     [project.entry-points."sglang.srt.plugins"]
     dummy_forward = "dummy_srt_platform_plugin.fake_forward:register"
 
-Launch example (single stage, CPU, TP or DP is transparent to this hook):
-
-    SGLANG_PLATFORM=dummy python -m sglang.launch_server \
-        --model-path <hf-model-id-or-local-config-dir> \
-        --load-format dummy \
-        --device cpu
-
-DUMMY_FORWARD_MODE controls what the fake logits look like:
+DUMMY_FORWARD_MODE controls what the fake logits look like (unchanged from
+Stage 1/2):
     "hash"   (default) -- deterministic, derived from batch metadata that
               is identical across TP ranks. Safe for TP, DP, and PP.
     "fixed"  -- always favors DUMMY_FORWARD_TOKEN_ID (or token 0 if unset).
               Every request converges almost immediately -- useful for
               pure throughput/latency load testing.
     "random" -- uniform random logits. Cheapest, but only safe when
-              tp_size == 1 (see TP note above).
+              tp_size == 1 (see TP note below).
+
+TP (tensor parallel): No extra code needed. Each TP rank runs in its own
+    scheduler subprocess, and load_plugins() runs independently in every
+    subprocess, so this hook is applied on every rank automatically.
+    Correctness caveat unchanged from Stage 1/2: real TP relies on
+    collectives to keep logits identical across ranks before sampling.
+    This hook's own logits substitution skips those collectives, so only
+    use DUMMY_FORWARD_MODE="hash" or "fixed" when tp_size > 1 -- both are
+    derived from batch metadata already identical across ranks. "random"
+    draws independently per process and WILL desync ranks under TP.
 """
 
 import logging
@@ -84,8 +92,6 @@ import os
 import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
-from sglang.srt.model_executor.model_runner import ModelRunnerOutput
 from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
 logger = logging.getLogger(__name__)
@@ -101,30 +107,35 @@ def register():
         _fake_forward,
         HookType.AROUND,
     )
-    logger.info("dummy_forward plugin registered (mode=%s)", _MODE)
+    logger.info("dummy_forward plugin registered (mode=%s, Stage 3 post-forward substitution)", _MODE)
 
 
 def _fake_forward(original_fn, self, forward_batch, *args, **kwargs):
-    """AROUND hook: never calls original_fn, so the real model.forward()
-    (and every matmul inside it, on every PP stage) never runs."""
-    # logger.info("dummy_forward plugin _fake_forward invoked, original_fn=%s, forward_batch=%s", original_fn, forward_batch)
-    device = self.device
-    num_tokens = forward_batch.input_ids.shape[0]
+    """AROUND hook: DOES call original_fn now (Stage 3) -- the real
+    model.forward() runs, on meta tensors, through torch.compile/Dynamo,
+    hitting DummyPiecewiseBackend at every real compiled-piece boundary and
+    fake_attention.py's hooks for the real (eager, never-compiled)
+    attention calls in between. Only the final logits value is replaced,
+    and only on the PP rank that actually produces them."""
+    output = original_fn(self, forward_batch, *args, **kwargs)
 
     if not self.pp_group.is_last_rank:
-        # Intermediate PP stage: downstream code expects hidden states to
-        # forward to the next stage, not logits. hidden_size covers the
-        # common "hidden_states" (+ "residual") convention used by most
-        # PP-enabled model implementations; harmless if the next stage
-        # doesn't look up "residual".
-        hidden_size = self.model_config.hidden_size
-        zeros = torch.zeros(num_tokens, hidden_size, device=device)
-        proxy = PPProxyTensors({"hidden_states": zeros, "residual": zeros.clone()})
-        return ModelRunnerOutput(logits_output=proxy, can_run_graph=False)
+        # Intermediate PP stage: the real (meta) forward pass already built
+        # a correct PPProxyTensors with meta hidden-state tensors in it --
+        # nothing to substitute here. The next PP stage's real (meta)
+        # forward consumes it exactly as it would on a real GPU.
+        return output
 
+    device = self.device
+    num_tokens = forward_batch.input_ids.shape[0]
     vocab_size = self.model_config.vocab_size
-    logits_output = _fake_logits_output(forward_batch, num_tokens, vocab_size, device)
-    return ModelRunnerOutput(logits_output=logits_output, can_run_graph=False)
+
+    # Replace only the logits value; every other field on `output`
+    # (can_run_graph, expert_distribution_metrics, routed_experts_output,
+    # indexer_topk_output) was already set correctly by the real forward
+    # pass that just ran, so it's left untouched rather than reconstructed.
+    output.logits_output = _fake_logits_output(forward_batch, num_tokens, vocab_size, device)
+    return output
 
 
 def _fake_logits_output(forward_batch, num_tokens, vocab_size, device):

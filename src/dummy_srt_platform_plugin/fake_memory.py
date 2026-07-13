@@ -75,12 +75,6 @@ def _fake_available_memory(
 
     total = current_platform.get_device_total_memory()
     used = current_platform.get_current_memory_usage()
-    logger.info(
-        "dummy_memory DIAGNOSTIC: id(current_platform)=%s total=%s used=%s",
-        id(current_platform),
-        total,
-        used,
-    )
     available_gb = (total - used) / (1 << 30)  # bytes -> GB, matching original_fn's units
 
     if distributed and cpu_group is not None:
@@ -91,11 +85,5 @@ def _fake_available_memory(
             tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
         )
         available_gb = tensor.item()
-        
-    import os
-    logger.info(
-        "dummy_memory DIAGNOSTIC: pid=%s id(current_platform)=%s total=%s used=%s",
-        os.getpid(), id(current_platform), total, used,
-    )
 
     return available_gb

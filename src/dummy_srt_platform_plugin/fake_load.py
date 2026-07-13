@@ -122,9 +122,7 @@ def _fake_load_model(original_fn, self, *, model_config, device_config):
 
     with set_default_torch_dtype(model_config.dtype):
         with torch.device("meta"):
-            logger.info( "dummy_load: model_config.hf_config.moe_intermediate_size=%s", getattr(model_config.hf_config, "moe_intermediate_size", "MISSING"),)
             model = _initialize_model(model_config, self.load_config, quant_config)
-            
 
         # Deliberately NOT called, unlike the real DummyModelLoader:
         #   initialize_dummy_weights(model)     -- no storage to write into,
@@ -154,27 +152,10 @@ def _fake_load_model(original_fn, self, *, model_config, device_config):
 
     for dtype, b in sorted(bytes_by_dtype.items(), key=lambda x: -x[1]):
         logger.info("dummy_load: %s: %.2f GB", dtype, b / (1 << 30))
-        logger.info(
-            "dummy_load: this rank's (fake) weights would occupy %.2f GB of real "
-            "VRAM",
-            weight_bytes / (1 << 30),
-        )
-    for name, p in model.named_parameters():
-        if "layers.0." in name :
-            logger.info("dummy_load: %s shape=%s dtype=%s", name, tuple(p.shape), p.dtype)
-        
-    print("STASH SIDE __dict__:", current_platform.__dict__, flush=True)
+
     logger.info(
-        "dummy_load DIAGNOSTIC: id(current_platform)=%s stashed=%s readback=%s",
-        id(current_platform),
-        weight_bytes,
-        current_platform.get_current_memory_usage(),
-    )
-    
-    import os
-    logger.info(
-        "dummy_load DIAGNOSTIC: pid=%s id(current_platform)=%s stashed=%s",
-        os.getpid(), id(current_platform), weight_bytes,
+        "dummy_load: this rank's (fake) weights would occupy %.2f GB of real VRAM",
+        weight_bytes / (1 << 30),
     )
 
     return model.eval()

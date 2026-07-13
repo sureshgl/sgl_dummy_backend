@@ -3,32 +3,25 @@ Dummy device mixin for CPU-backed dummy platform.
 """
 
 import logging
-import os
 import platform as _platform
 from typing import Optional
 
 import torch
 
 from sglang.srt.platforms.device_mixin import DeviceMixin, DeviceCapability, PlatformEnum
+from dummy_srt_platform_plugin.gpu_spec import current_gpu_spec
 
 logger = logging.getLogger(__name__)
 
-# GPU name -> total VRAM, in bytes. Selected via the DUMMY_GPU environment
-# variable (plugins can't register new SGLang CLI flags -- see fake_memory.py
-# for why current_platform is the seam every consumer of this table goes
-# through instead of reading DUMMY_GPU directly).
-_GPU_VRAM_BYTES: dict[str, int] = {
-    "T4-16GB": 16 * 1024**3,
-    "A10-24GB": 24 * 1024**3,
-    "L4-24GB": 24 * 1024**3,
-    "L40-48GB": 48 * 1024**3,
-    "A100-40GB": 40 * 1024**3,
-    "A100-80GB": 80 * 1024**3,
-    "H100-80GB": 80 * 1024**3,
-    "H200-141GB": 138 * 1024**3,
-    "B200-192GB": 192 * 1024**3,
-}
-_DEFAULT_GPU_NAME = "A100-80GB"
+# GPU VRAM/FLOPS/bandwidth specs now live in gpu_spec.py -- a single source
+# of truth shared with cost_model.py's latency emulation, both resolved via
+# the same DUMMY_GPU environment variable. This used to be a separate
+# _GPU_VRAM_BYTES table here, resolved independently of cost_model.py's own
+# (differently-keyed, differently-env-var'd) table -- consolidated so
+# memory emulation and latency emulation can never disagree about which GPU
+# is being emulated. See gpu_spec.py for the full mapping and the
+# BREAKING CHANGE note (DUMMY_GPU now takes short keys like "h200" instead
+# of descriptive ones like "H200-141GB").
 
 
  # Module-level, not on any instance -- immune to whatever is re-resolving
@@ -63,7 +56,6 @@ class DummyDeviceMixin(DeviceMixin):
         # builds a model and stashes the real per-rank weight footprint
         # here directly on current_platform (this same instance) -- see
         # fake_load.py.
-        print(f"dummy_device_mixin DIAGNOSTIC: __init__ called pid=",os.getpid())
 
     # ------------------------------------------------------------------
     # Active methods (called by SGLang core)
@@ -72,24 +64,20 @@ class DummyDeviceMixin(DeviceMixin):
     def get_device_total_memory(self, device_id: int = 0) -> int:
         """[Active] Get the emulated GPU's total VRAM, in bytes.
 
-        Looks up DUMMY_GPU (falls back to _DEFAULT_GPU_NAME if unset) in the
-        _GPU_VRAM_BYTES table above. This is the actual seam SGLang core
-        consults for GPU-memory-tiered decisions on an OOT platform --
+        Resolves via gpu_spec.current_gpu_spec() (DUMMY_GPU env var, cached
+        after first resolution) -- the single source of truth also used by
+        cost_model.py's CostModel for peak FLOPS/bandwidth, so memory and
+        latency emulation always agree on which GPU is being emulated. This
+        is the actual seam SGLang core consults for GPU-memory-tiered
+        decisions on an OOT platform --
         sglang.srt.utils.common.get_device_memory_capacity() calls this
         method directly whenever current_platform.is_out_of_tree() is True,
         which is what ultimately drives ServerArgs' chunked_prefill_size
-        GPU-tier selection. Raises rather than silently substituting a
-        default on an unrecognized name -- a wrong "GPU" should never be
-        mistaken for a real memory figure.
+        GPU-tier selection. current_gpu_spec() raises rather than silently
+        substituting a default on an unrecognized name -- a wrong "GPU"
+        should never be mistaken for a real memory figure.
         """
-        gpu_name = os.environ.get("DUMMY_GPU", _DEFAULT_GPU_NAME)
-        try:
-            return _GPU_VRAM_BYTES[gpu_name]
-        except KeyError:
-            raise ValueError(
-                f"Unknown DUMMY_GPU={gpu_name!r}. Supported names: "
-                f"{sorted(_GPU_VRAM_BYTES)}"
-            )
+        return current_gpu_spec().vram_bytes
 
     def get_current_memory_usage(self, device: Optional[torch.device] = None) -> float:
         """[Active] Get how much of the emulated VRAM the (fake) model

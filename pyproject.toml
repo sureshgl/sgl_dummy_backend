@@ -33,6 +33,10 @@ dummy_forward = "dummy_srt_platform_plugin.fake_forward:register"
 dummy_load = "dummy_srt_platform_plugin.fake_load:register"
 dummy_memory = "dummy_srt_platform_plugin.fake_memory:register"
 dummy_pynccl = "dummy_srt_platform_plugin.fake_pynccl:register"
+dummy_attention = "dummy_srt_platform_plugin.fake_attention:register"
+dummy_quant = "dummy_srt_platform_plugin.fake_quant:register"
+dummy_graph_pool = "dummy_srt_platform_plugin.fake_graph_pool:register"
+dummy_support_triton = "dummy_srt_platform_plugin.fake_triton_support:register"
 
 [tool.setuptools]
 packages = {find = {where = ["src"]}}

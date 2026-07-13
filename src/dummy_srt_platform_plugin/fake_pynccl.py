@@ -60,14 +60,20 @@ def register():
         _fake_init_model_parallel_group,
         HookType.AROUND,
     )
-    logger.info("dummy_pynccl plugin registered (pynccl disabled for gloo backend)")
+    print("dummy_pynccl plugin registered (pynccl disabled for gloo backend)")
 
 
 def _fake_init_model_parallel_group(original_fn, group_ranks, local_rank, backend, **kwargs):
-    """AROUND hook: forces use_pynccl=False for the gloo backend, then calls
-    straight through to the real function -- everything else about group
-    construction (world group, tp group, message-queue broadcaster, custom
-    all-reduce, etc.) stays completely real and untouched."""
-    if backend == "gloo":
-        kwargs["use_pynccl"] = False
+    """AROUND hook: previously gated on backend == "gloo" so this stayed
+    correct for any gloo-backed platform, not just this one. Loosened to
+    unconditional after a real launch showed PyNcclCommunicator still being
+    constructed despite backend presumably being "gloo" for the world
+    group -- meaning either a different subgroup receives a different
+    backend string, or GroupCoordinator's own use_pynccl resolution no
+    longer trusts this kwarg the way it did when this hook was written.
+    Forcing use_pynccl=False unconditionally is safe here specifically
+    because this hook only ever runs at all on a plugin-loaded process,
+    and no legitimate real-GPU deployment would ever load this plugin."""
+    logger.info("dummy_pynccl plugin: forcing use_pynccl=False for init_model_parallel_group (backend=%s)", backend)
+    kwargs["use_pynccl"] = False
     return original_fn(group_ranks, local_rank, backend, **kwargs)
