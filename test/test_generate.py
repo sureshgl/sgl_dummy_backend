@@ -14,7 +14,7 @@ def test_generate():
     try:
         resp = requests.post("http://localhost:30000/generate", json={
             "text": "The capital of France is",
-            "sampling_params": {"max_new_tokens": 8, "temperature": 0}
+            "sampling_params": {"max_new_tokens":   8, "temperature": 0}
         })
         assert resp.status_code == 200
         assert "text" in resp.json()
