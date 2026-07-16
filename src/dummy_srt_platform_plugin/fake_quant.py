@@ -98,6 +98,77 @@ pyproject.toml addition:
 
     [project.entry-points."sglang.srt.plugins"]
     dummy_quant = "dummy_srt_platform_plugin.fake_quant:register"
+
+Why the roofline sleep is a torch.library.custom_op, not a bare time.sleep
+----------------------------------------------------------------------------
+Both apply() hooks below are reached from TWO different call contexts:
+
+  1. Real per-request serving (eager -- no tracing involved).
+  2. TcPiecewiseCudaGraphBackend's compile-pass warmup, which calls
+     self.model_runner.model.forward(...) DIRECTLY (see docstring above).
+     Whenever that forward is under torch.compile / piecewise capture,
+     Dynamo traces straight into apply()'s Python body -- these hook
+     functions are NOT shielded by any compiled-artifact boundary the way
+     DummyPiecewiseBackend.__call__ is (that class is only ever invoked
+     AFTER compilation, once per graph replay -- Dynamo never steps into
+     it). A bare `time.sleep()` inlined in apply()'s body is therefore
+     something Dynamo/AOTAutograd's FakeTensor propagation has to trace
+     through directly, which either forces a graph break or, worse, feeds
+     a side-effecting, shape-less call into fake-tensor propagation --
+     producing None-propagation / shape-collapse failures.
+
+  Fix: the actual "produce a tensor + sleep for the roofline-estimated
+  duration" step is wrapped in a torch.library.custom_op
+  (_fake_fp8_linear_op / _fake_fp8_moe_op below), each with a matching
+  register_fake implementation. custom_op calls are opaque to Dynamo --
+  it records a single graph node for the call and never inlines the real
+  implementation's body, so:
+    - During tracing / AOTAutograd fake-tensor propagation, ONLY the
+      register_fake stand-in runs: shape/dtype-only, zero side effects,
+      never sleeps.
+    - The real implementation (time.sleep + torch.empty) only executes at
+      genuine execution time -- eager serving, or the op being replayed as
+      a node inside an already-compiled graph -- never during tracing.
+  All FLOPs/bytes/latency arithmetic (CostModel.estimate, dimension
+  resolution, etc.) stays as plain Python in the hook functions themselves
+  -- it's pure arithmetic on shapes/ints, has no side effects, and is safe
+  for Dynamo to trace through unchanged. Only the actual sleep is
+  relocated into the custom op's real implementation.
+
+Why `latency` must NEVER be passed into the custom_op as a scalar arg
+----------------------------------------------------------------------------
+CONFIRMED via a real crash: passing a Python float `latency` -- computed
+from CostModel.estimate(flops, bytes_moved), where flops/bytes_moved
+depend on num_tokens (input_ids.size()[0], the piecewise-compiled batch
+dimension) -- as a schema `float` argument to the custom_op is itself a
+Dynamo recompile-storm bug, separate from (and on top of) the tracing
+crash the custom_op split fixes.
+
+Custom op schemas only support plain Tensor/int/float/bool/etc, with no
+notion of a "symbolic float." A Python float argument derived from a
+SymInt is therefore baked in as a SPECIALIZED CONSTANT the first time the
+op is traced for a given shape, and Dynamo guards on that exact value
+holding on every subsequent call. TcPiecewiseCudaGraphBackend's
+compile-pass warmup deliberately calls _run_dummy_forward across MANY
+different token counts (one per piecewise shape bucket it needs to
+capture) -- so `latency` takes on a new concrete value on nearly every
+warmup call, each one busting the previous guard and forcing a full
+recompile. Once more than `torch._dynamo.config.recompile_limit` (default
+8) distinct values are hit, Dynamo hard-fails with
+FailOnRecompileLimitHit under fullgraph=True instead of silently
+tolerating it.
+
+Fix: never let a batch-size-dependent value cross the custom_op boundary
+as a scalar argument. The entire FLOPs/bytes/latency computation
+(including the num_tokens-dependent part) moves INSIDE the real op
+implementation, operating on the op's own real, concrete tensor shape at
+actual execution time -- which is invisible to Dynamo (not a traced
+input at all, so nothing to guard on). Only genuinely per-layer-static
+quantities that never change call to call for a given layer instance
+(out_features, input_size_per_partition, elem_size, top_k, hidden_size,
+intermediate_size) are passed in as scalar args -- these are safe because
+they don't vary with batch size, so no per-shape recompiles are ever
+triggered by them.
 """
 
 import logging
@@ -126,6 +197,117 @@ def _get_cost_model() -> CostModel:
     if "model" not in _cost_model_holder:
         _cost_model_holder["model"] = CostModel()
     return _cost_model_holder["model"]
+
+
+# ---------------------------------------------------------------------
+# custom_op boundary -- see module docstring's "Why the roofline sleep is
+# a torch.library.custom_op" section for the full rationale. Only the
+# real implementations below ever call time.sleep; the register_fake
+# stand-ins are what Dynamo/AOTAutograd actually call during tracing and
+# must stay side-effect-free and data-independent (shape/dtype only).
+# ---------------------------------------------------------------------
+
+@torch.library.custom_op("dummy_quant::fake_fp8_linear", mutates_args=())
+def _fake_fp8_linear_op(
+    x: torch.Tensor,
+    out_features: int,
+    input_size_per_partition: int,
+    elem_size: int,
+) -> torch.Tensor:
+    """Real implementation -- only ever runs at genuine execution time
+    (eager per-request serving, or this op being replayed as a node
+    inside an already-compiled/piecewise graph). Never called during
+    Dynamo tracing or AOTAutograd fake-tensor propagation -- register_fake
+    below is what runs then instead.
+
+    Deliberately computes m (num_tokens) and the CostModel estimate HERE,
+    from x's own real, concrete shape at actual execution time -- NOT
+    passed in as a `latency` scalar argument. A batch-size-dependent
+    Python float passed into a custom_op schema gets specialized as a
+    compile-time constant and guarded on by Dynamo; since num_tokens
+    changes on nearly every call during piecewise-shape warmup, that
+    guard fails constantly and blows the recompile_limit (see module
+    docstring's "Why `latency` must NEVER be passed into the custom_op as
+    a scalar arg" -- confirmed via a real FailOnRecompileLimitHit crash).
+    out_features/input_size_per_partition/elem_size are safe to pass in
+    because they're per-layer-static -- they never change call to call
+    for a given layer instance, so no per-shape recompiles result."""
+    m = _numel_leading((*x.shape[:-1], 1))
+    flops, bytes_moved = _linear_flops_bytes_from_dims(
+        m, input_size_per_partition, out_features, elem_size
+    )
+    try:
+        latency = _get_cost_model().estimate(flops, bytes_moved)
+    except Exception as e:
+        logger.debug(
+            "dummy_quant: Fp8LinearMethod latency estimation failed (%s); "
+            "skipping sleep",
+            e,
+        )
+        latency = 0.0
+    if latency > 0.0:
+        time.sleep(latency)
+    return torch.empty((*x.shape[:-1], out_features), dtype=x.dtype, device=x.device)
+
+
+@_fake_fp8_linear_op.register_fake
+def _fake_fp8_linear_op_fake(
+    x: torch.Tensor,
+    out_features: int,
+    input_size_per_partition: int,
+    elem_size: int,
+) -> torch.Tensor:
+    """Fake/meta stand-in -- called by Dynamo/AOTAutograd/Inductor during
+    tracing and shape propagation instead of the real implementation.
+    Shape/dtype/device-only, zero side effects, never sleeps, never
+    touches CostModel -- input_size_per_partition/elem_size are accepted
+    (schema must match) but deliberately unused here."""
+    return torch.empty((*x.shape[:-1], out_features), dtype=x.dtype, device=x.device)
+
+
+@torch.library.custom_op("dummy_quant::fake_fp8_moe", mutates_args=())
+def _fake_fp8_moe_op(
+    hidden_states: torch.Tensor,
+    top_k: float,
+    hidden_size: float,
+    intermediate_size: float,
+    elem_size: int,
+) -> torch.Tensor:
+    """Real implementation -- see _fake_fp8_linear_op's docstring above;
+    identical reasoning. num_tokens is derived from hidden_states' real,
+    concrete shape at actual execution time, never passed in as part of
+    a latency scalar -- top_k/hidden_size/intermediate_size/elem_size are
+    all per-layer-static (don't vary with batch size), so they're safe to
+    pass as scalar args without triggering per-shape recompiles."""
+    num_tokens = float(_numel_leading((*hidden_states.shape[:-1], 1)))
+    flops, bytes_moved = _moe_flops_bytes(
+        num_tokens, top_k, hidden_size, intermediate_size, elem_size
+    )
+    try:
+        latency = _get_cost_model().estimate(flops, bytes_moved)
+    except Exception as e:
+        logger.debug(
+            "dummy_quant: Fp8MoEMethod latency estimation failed (%s); "
+            "skipping sleep",
+            e,
+        )
+        latency = 0.0
+    if latency > 0.0:
+        time.sleep(latency)
+    return torch.empty_like(hidden_states)
+
+
+@_fake_fp8_moe_op.register_fake
+def _fake_fp8_moe_op_fake(
+    hidden_states: torch.Tensor,
+    top_k: float,
+    hidden_size: float,
+    intermediate_size: float,
+    elem_size: int,
+) -> torch.Tensor:
+    """Fake/meta stand-in -- see _fake_fp8_linear_op_fake's docstring
+    above; identical reasoning."""
+    return torch.empty_like(hidden_states)
 
 
 def register():
@@ -177,6 +359,17 @@ def _numel_leading(shape) -> int:
 # Fp8LinearMethod.apply
 # ---------------------------------------------------------------------
 
+def _linear_flops_bytes_from_dims(m: int, k: int, n: int, elem_size: int):
+    """Dims-only roofline FLOPs/bytes for one quantized linear call --
+    schema-safe (takes only plain ints, no `layer` object), since this is
+    called directly from _fake_fp8_linear_op's real implementation, which
+    only ever has concrete tensors/ints to work with -- not the original
+    `layer` (custom_op schemas don't support arbitrary Python objects)."""
+    flops = 2.0 * m * k * n
+    bytes_moved = (m * k + k * n + m * n) * elem_size
+    return flops, bytes_moved
+
+
 def _linear_flops_bytes(layer, x: torch.Tensor, out_features: int, elem_size: int):
     """Coarse roofline FLOPs/bytes for one quantized linear call.
 
@@ -187,13 +380,20 @@ def _linear_flops_bytes(layer, x: torch.Tensor, out_features: int, elem_size: in
     time by SGLang's own ColumnParallelLinear/RowParallelLinear, matching
     the same per-rank-correct-by-construction reasoning fake_load.py's
     weight_bytes figure already relies on).
+
+    NOTE: no longer called from _fake_fp8_linear_apply's hot path -- that
+    computation now lives inside _fake_fp8_linear_op's real implementation
+    (see module docstring's recompile-limit section for why m must be
+    derived from the op's own concrete runtime shape, not passed in as a
+    scalar). Kept as a layer-aware convenience wrapper around
+    _linear_flops_bytes_from_dims for anything (tests, ad-hoc debugging)
+    that still wants to estimate cost given a real `layer` object.
     """
     m = _numel_leading(x.shape)
     k = getattr(layer, "input_size_per_partition", None) or x.shape[-1]
     n = out_features
 
-    flops = 2.0 * m * k * n
-    bytes_moved = (m * k + k * n + m * n) * elem_size
+    flops, bytes_moved = _linear_flops_bytes_from_dims(m, k, n, elem_size)
     return flops, bytes_moved, m
 
 
@@ -232,26 +432,32 @@ def _fake_fp8_linear_apply(original_fn, self, layer, x, bias=None):
     = this rank's output_size_per_partition, dtype = x.dtype (the
     layer's activation dtype -- bf16/fp16 -- not the fp8 weight dtype;
     quantized linear layers dequantize back to activation dtype on output,
-    confirmed by every quant scheme's apply() contract in this codebase)."""
+    confirmed by every quant scheme's apply() contract in this codebase).
+
+    Only resolves per-layer-static quantities here (out_features,
+    input_size_per_partition, elem_size) -- none of these vary call to
+    call for a given layer instance, so passing them into the custom_op
+    as scalar args triggers no per-shape Dynamo recompiles. The
+    num_tokens-dependent FLOPs/bytes/latency estimate and the actual sleep
+    both live inside _fake_fp8_linear_op's real implementation now -- see
+    module docstring's recompile-limit section for why that split is
+    required, not optional."""
     out_features = _resolve_linear_output_features(layer, x)
+    input_size_per_partition = int(
+        getattr(layer, "input_size_per_partition", None) or x.shape[-1]
+    )
+    elem_size = _dtype_size_bytes(x.dtype)
 
-    try:
-        elem_size = _dtype_size_bytes(x.dtype)
-        flops, bytes_moved, _m = _linear_flops_bytes(layer, x, out_features, elem_size)
-        latency = _get_cost_model().estimate(flops, bytes_moved)
-    except Exception as e:
-        logger.debug(
-            "dummy_quant: Fp8LinearMethod latency estimation failed (%s); "
-            "skipping sleep",
-            e,
-        )
-        latency = 0.0
-
-    if latency:
-        time.sleep(latency)
-
-    output = torch.empty(
-        (*x.shape[:-1], out_features), dtype=x.dtype, device=x.device
+    # Routed through a torch.library.custom_op rather than a bare
+    # time.sleep()/torch.empty() inlined here -- this hook body itself can
+    # be traced by Dynamo (compile-pass warmup calls model.forward()
+    # directly; see module docstring), so the actual sleep must live where
+    # Dynamo can't inline it. See module docstring's "Why the roofline
+    # sleep is a torch.library.custom_op" and "Why `latency` must NEVER be
+    # passed into the custom_op as a scalar arg" sections, and
+    # _fake_fp8_linear_op above.
+    output = torch.ops.dummy_quant.fake_fp8_linear(
+        x, out_features, input_size_per_partition, elem_size
     )
     if bias is not None:
         # Real quant methods that receive a non-None bias are expected to
@@ -310,13 +516,6 @@ def _resolve_moe_dims(layer, hidden_states: torch.Tensor):
         or hidden_size
     )
     return float(top_k), float(hidden_size), float(intermediate_size)
-
-
-def _fake_moe_output_like(hidden_states: torch.Tensor) -> torch.Tensor:
-    """Real MoE apply() returns combined expert output the same shape/dtype
-    as the dispatched hidden states (post-combine, pre-residual-add) --
-    matched here regardless of which call-signature branch fired."""
-    return torch.empty_like(hidden_states)
 
 
 def _fake_fp8_moe_apply(original_fn, self, layer, *args, **kwargs):
@@ -392,26 +591,35 @@ def _fake_fp8_moe_apply(original_fn, self, layer, *args, **kwargs):
         logger.info("dummy_quant: Fp8MoEMethod.apply fake using branch: %s", branch)
         _moe_signature_logged["done"] = True
 
+    # Only resolve per-layer-static dims here (top_k/hidden_size/
+    # intermediate_size/elem_size never vary call to call for a given
+    # layer instance -- unlike num_tokens, which changes with batch size
+    # on nearly every piecewise-warmup call). Passing ONLY these into the
+    # custom_op as scalar args triggers no per-shape Dynamo recompiles.
+    # num_tokens, the FLOPs/bytes/latency estimate, and the actual sleep
+    # all live inside _fake_fp8_moe_op's real implementation now -- see
+    # module docstring's recompile-limit section for why that split is
+    # required, not optional.
     try:
-        num_tokens = float(_numel_leading((*hidden_states.shape[:-1], 1)))
         top_k, hidden_size, intermediate_size = _resolve_moe_dims(layer, hidden_states)
         elem_size = _dtype_size_bytes(hidden_states.dtype)
-        flops, bytes_moved = _moe_flops_bytes(
-            num_tokens, top_k, hidden_size, intermediate_size, elem_size
-        )
-        latency = _get_cost_model().estimate(flops, bytes_moved)
     except Exception as e:
         logger.debug(
-            "dummy_quant: Fp8MoEMethod latency estimation failed (%s); "
-            "skipping sleep",
+            "dummy_quant: Fp8MoEMethod dim resolution failed (%s); "
+            "falling back to top_k=1.0",
             e,
         )
-        latency = 0.0
+        top_k, hidden_size, intermediate_size = 1.0, float(hidden_states.shape[-1]), float(hidden_states.shape[-1])
+        elem_size = _dtype_size_bytes(hidden_states.dtype)
 
-    if latency:
-        time.sleep(latency)
-
-    fake_output = _fake_moe_output_like(hidden_states)
+    # Routed through a torch.library.custom_op rather than a bare
+    # time.sleep()/torch.empty_like() inlined here -- same reasoning as
+    # _fake_fp8_linear_apply above: this hook body can itself be traced by
+    # Dynamo during compile-pass warmup, so the sleep must live somewhere
+    # Dynamo treats as opaque. See module docstring and _fake_fp8_moe_op.
+    fake_output = torch.ops.dummy_quant.fake_fp8_moe(
+        hidden_states, top_k, hidden_size, intermediate_size, elem_size
+    )
 
     if dispatch_output is not None:
         # CONFIRMED against real source (token_dispatcher/standard.py) for

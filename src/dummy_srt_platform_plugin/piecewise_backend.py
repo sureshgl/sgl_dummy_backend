@@ -37,6 +37,23 @@ forward pass (e.g. logits), and that substitution happens one layer up, in
 fake_forward.py's post-forward hook -- NOT here. This backend fakes time;
 the forward hook fakes values. Keeping those two concerns separate keeps
 this class from needing to know whether it's "the last piece".
+
+BUGFIX (confirmed via a real launch + real traceback): a compiled piece
+with MULTIPLE outputs (a tuple, e.g. q/k/v feeding directly into a
+downstream split-op like unified_attention_with_output) could silently
+materialize as a tuple with one or more None elements inside it, if
+shape/dtype extraction failed for just ONE of those outputs while
+succeeding for the others. The old __call__ only checked whether the
+WHOLE materialized result was None -- a tuple containing a None element
+is not None itself, so that check passed, and a tuple like
+(real_tensor, real_tensor, None, real_tensor) was returned as-is. That
+None then propagated into whatever split-op consumed it (observed:
+unified_attention_with_output's `query` argument arriving as None,
+crashing with "'NoneType' object is not subscriptable" on
+`query[:real_num_tokens]`). Fixed by recursively checking for any None
+anywhere inside the materialized structure and treating that the same as
+a fully-failed extraction -- falling back to the real
+compiled_graph_for_general_shape(*args) call instead.
 """
 
 import logging
@@ -168,7 +185,13 @@ def _output_meta_nodes(graph: Any) -> Optional[Any]:
 
 def _materialize_meta_like(val: Any) -> Any:
     """Recursively build fresh torch.device('meta') tensor(s) matching the
-    shape/dtype recorded on `val` (a Node, or tuple/list of Nodes)."""
+    shape/dtype recorded on `val` (a Node, or tuple/list of Nodes).
+
+    Returns None for any single element whose shape/dtype can't be
+    extracted -- callers MUST check the result with _contains_none()
+    before trusting a tuple/list result, since a tuple with one None
+    element is not None itself (see _contains_none's docstring and this
+    module's BUGFIX note)."""
     if isinstance(val, (tuple, list)):
         made = [_materialize_meta_like(v) for v in val]
         return tuple(made) if isinstance(val, tuple) else made
@@ -177,6 +200,22 @@ def _materialize_meta_like(val: Any) -> Any:
         return None
     shape, dtype = info
     return torch.empty(shape, dtype=dtype, device="meta")
+
+
+def _contains_none(val: Any) -> bool:
+    """True if `val` is None, or is a tuple/list containing None anywhere
+    (recursively). Needed because _materialize_meta_like can partially
+    succeed on a multi-output piece: the top-level tuple/list itself is
+    non-None even if one of its elements failed extraction and came back
+    as None -- a plain `is not None` check on the whole structure misses
+    that case entirely (confirmed by a real crash: a None element reached
+    a downstream split-op as a genuinely None argument instead of a meta
+    tensor, see this module's BUGFIX note above)."""
+    if val is None:
+        return True
+    if isinstance(val, (tuple, list)):
+        return any(_contains_none(v) for v in val)
+    return False
 
 
 class DummyPiecewiseBackend:
@@ -216,10 +255,10 @@ class DummyPiecewiseBackend:
             total_piecewise_compiles: Total number of piecewise compiles.
             sym_shape_indices: Indices of symbolic shapes in the input.
             compiled_graph_for_general_shape: Callable for the real
-                general-shape compiled graph. Never invoked in normal
-                operation -- kept only as a fallback for callers that pass a
-                non-FX-graph `graph` (e.g. a mock in a unit test), so
-                existing tests keep passing.
+                general-shape compiled graph. Invoked whenever output-spec
+                extraction fails (fully, or partially -- see BUGFIX note
+                above), so this remains a real, exercised fallback path,
+                not just a defensive one kept for mock-based unit tests.
             sglang_backend: Backend instance from SGLang.
         """
         self.graph = graph
@@ -295,9 +334,14 @@ class DummyPiecewiseBackend:
         Emulate executing this compiled piece.
 
         Never touches compiled_graph_for_general_shape or real memory in
-        normal operation. Sleeps for a roofline-estimated latency (computed
-        once on first call, cached thereafter) and returns fresh meta
-        tensor(s) shaped like this piece's real output.
+        normal operation -- EXCEPT when this piece's output-spec
+        extraction failed, fully or partially (see BUGFIX note above),
+        in which case the real compiled callable is invoked instead of
+        returning a broken (possibly None-containing) result.
+
+        Sleeps for a roofline-estimated latency (computed once on first
+        call, cached thereafter) and returns fresh meta tensor(s) matching
+        this piece's real output shape/dtype.
         """
         if self._cached_latency is None:
             self._compute_latency_and_output_spec()
@@ -307,10 +351,18 @@ class DummyPiecewiseBackend:
 
         if self._cached_output_spec is not None:
             materialized = _materialize_meta_like(self._cached_output_spec)
-            if materialized is not None:
+            if not _contains_none(materialized):
                 return materialized
+            logger.debug(
+                "DummyPiecewiseBackend piece %d/%d: materialized output "
+                "contained a None element (partial shape/dtype extraction "
+                "failure) -- falling back to compiled_graph_for_general_shape",
+                self.piecewise_compile_index + 1,
+                self.total_piecewise_compiles,
+            )
 
-        # Fallback path: only reached when `graph` wasn't a real FX graph we
-        # could introspect (e.g. a MagicMock in a unit test). Preserves the
-        # original Stage 1/2 behavior so existing tests keep passing.
+        # Fallback path: reached when `graph` wasn't a real FX graph we
+        # could introspect (e.g. a MagicMock in a unit test), OR when
+        # output-spec extraction succeeded at the top level but produced a
+        # None inside a multi-output tuple/list (see BUGFIX note above).
         return self.compiled_graph_for_general_shape(*args)

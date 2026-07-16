@@ -156,26 +156,24 @@ class DummySRTPlatform(SRTPlatform, DummyDeviceMixin):
     def get_piecewise_backend_cls(self) -> type:
         """Return the piecewise compilation backend class for this platform.
 
-        Kept as a real, working implementation (DummyPiecewiseBackend) even
-        though it is currently UNREACHABLE via SGLang's real tc_piecewise
-        pipeline -- confirmed against current upstream source that
-        PiecewiseCompileInterpreter (inside SGLangBackend, the torch.compile
-        backend tc_piecewise installs) hardcodes CUDAPiecewiseBackend by
-        name with no platform-lookup indirection at all, so this method is
-        never actually consulted by that code path. support_piecewise_
-        cuda_graph() below returns False specifically so tc_piecewise is
-        never selected in the first place, avoiding that dead-end entirely
-        (see that method's docstring for the full chain of reasoning:
-        weak_ref_tensor is a compiled CUDA/NPU-only sgl-kernel op with no
-        CPU path, and a Dynamo probe confirmed fake_attention.py's plain
-        Python hooks are not compile-safe under fullgraph=True without
-        first being wrapped as proper custom ops -- a separate, larger
-        piece of follow-up work, not something to bolt on here).
+        Reachable again. Confirmed against real upstream source that
+        make_backend() (sglang.srt.compilation.backend, the function
+        PiecewiseCompileInterpreter.call_module() calls to construct each
+        per-subgraph wrapper) already dispatches through this exact method
+        for any current_platform.is_out_of_tree() platform:
 
-        Left in place (rather than deleted) because the FX-graph cost-
-        modeling logic in piecewise_backend.py is exactly what a future,
-        properly-custom-op-wrapped compile path would want to reuse; only
-        the SGLang-side wiring to reach it is currently absent.
+            if current_platform.is_out_of_tree():
+                backend_cls = current_platform.get_piecewise_backend_cls()
+            elif is_xpu(): ... elif is_npu(): ... else: backend_cls = CUDAPiecewiseBackend
+
+        There is no hardcoding to work around here -- this was previously
+        marked unreachable because support_piecewise_cuda_graph() returned
+        False, which meant tc_piecewise was never selected in the first
+        place (a separate gate, upstream in server_args.py), not because
+        this dispatch site itself was broken. See
+        support_piecewise_cuda_graph()'s docstring for what actually
+        blocked reachability, and why both blockers are now resolved rather
+        than worked around.
         """
         from dummy_srt_platform_plugin.piecewise_backend import DummyPiecewiseBackend
         return DummyPiecewiseBackend
@@ -209,20 +207,22 @@ class DummySRTPlatform(SRTPlatform, DummyDeviceMixin):
         if getattr(server_args, "attention_backend", None) in (None, "torch_native"):
             server_args.attention_backend = self.get_default_attention_backend()
 
-        # NOTE: tc_piecewise / cuda_graph_tc_compiler defaults were removed
-        # here (previously: cuda_graph_backend_prefill = "tc_piecewise",
-        # cuda_graph_tc_compiler = "eager"). Confirmed via a real crash
-        # chain (weak_ref_tensor.py raising NotImplementedError at import
-        # time on CPU) plus source-level tracing that tc_piecewise entails
-        # real CUDA graph capture end-to-end -- it is not separable into a
-        # "just get Dynamo-split FX graphs" half and a "real CUDA graph
-        # replay" half. support_piecewise_cuda_graph() below now returns
-        # False, so server_args.py's own OOT-platform compatibility check
-        # ("OOT platform without piecewise support") disables tc_piecewise
-        # automatically; no explicit backend default is needed or wanted
-        # here. Prefill now runs through the plain eager path
-        # (EagerRunner), which fake_forward.py / fake_attention.py /
-        # fake_quant.py already hook correctly.
+        # NOTE: tc_piecewise / cuda_graph_tc_compiler defaults are still not
+        # force-set here. support_piecewise_cuda_graph() below now returns
+        # True again -- but this time because the two concrete blockers
+        # that caused the earlier revert (weak_ref_tensor's import-time
+        # crash, and real torch.cuda.graph() capture with no CPU
+        # equivalent) both have real fixes in place rather than being
+        # worked around -- see that method's docstring for the full chain
+        # of reasoning. Since tc_piecewise is documented as SGLang's own
+        # enabled-by-default behavior once no compatibility rule vetoes it,
+        # and no rule does for this platform (see below), no explicit
+        # backend default should be needed here either -- but this has NOT
+        # yet been confirmed against a real launch. VERIFY: does the
+        # resolved cuda_graph_config.prefill.backend actually come back as
+        # "tc_piecewise" on an actual launch with this platform, or does
+        # some other rule still silently reset it to "disabled"? If so, set
+        # server_args.cuda_graph_config.prefill.backend explicitly here.
 
     def init_backend(self) -> None:
         """One-time backend initialization."""
@@ -236,54 +236,71 @@ class DummySRTPlatform(SRTPlatform, DummyDeviceMixin):
     def support_piecewise_cuda_graph(self) -> bool:
         """Whether this platform supports piecewise CUDA graph.
 
-        Returns False. Reverted from an earlier Stage 3 attempt that
-        returned True to unlock tc_piecewise, on the premise that
-        DummyPiecewiseBackend (get_piecewise_backend_cls() above) would be
-        consulted as the per-piece compiled callable. That premise does not
-        hold against current upstream SGLang source:
+        Returns True. Reversed again from the prior revert-to-False state --
+        this time because the two concrete blockers that caused that revert
+        each have a real fix in place, not a workaround:
 
-        - PiecewiseCompileInterpreter (inside SGLangBackend, the
-          torch.compile backend tc_piecewise's install_compile() wires up)
-          hardcodes CUDAPiecewiseBackend by class name, with no platform
-          hook or factory indirection at that point -- confirmed via
-          inspection and via a real crash (weak_ref_tensor.py raising
-          NotImplementedError at import time, deep inside
-          CUDAPiecewiseBackend's own import chain, before any per-piece
-          class selection could even matter).
-        - Beyond the import-time failure, tc_piecewise's Capture phase does
-          genuine torch.cuda.graph()-style CUDA graph recording -- a real
-          hardware capability with no CPU equivalent to fall back to,
-          confirmed against SGLang's own published PCG documentation
-          ("captured as a separate CUDA graph", "output tensors of the
-          last subgraph are stored as weak references to maximize memory
-          reuse" -- weak_ref_tensor was itself migrated into sgl-kernel as
-          a compiled CUDA/NPU-only op, per PR #12505). Upstream's own PCG
-          compatibility list already auto-disables "Non-CUDA hardware (AMD
-          ROCm, Ascend NPU)" for exactly this structural reason; CPU was
-          never a candidate either.
-        - A standalone Dynamo probe (torch.compile(model, backend=...) with
-          a plain Python function containing time.sleep() spliced into the
-          forward path, mirroring fake_attention.py's actual hook shape)
-          confirmed that under permissive (non-fullgraph) compilation,
-          Dynamo graph-breaks around the untraceable call -- but SGLang's
-          real install_compile() uses fullgraph=True, under which an
-          unregistered, untraceable call like this would hard-fail at
-          trace time instead of gracefully splitting. Making
-          fake_attention.py's hooks compile-safe under fullgraph=True would
-          require converting them into properly declared custom ops
-          (register_custom_op, with explicit split-point registration) --
-          a real, separate piece of follow-up work, not something to bolt
-          on to unblock this platform today.
+        1. weak_ref_tensor.py raising NotImplementedError at import time.
+           Fixed: __init__.py's activate() now stubs
+           sglang.srt.compilation.weak_ref_tensor in sys.modules before
+           anything can import sglang.srt.compilation.backend (which
+           unconditionally imports cuda_piecewise_backend.py, which
+           unconditionally imports weak_ref_tensor.py). Confirmed this
+           import chain was the ENTIRE crash -- get_piecewise_backend_cls()
+           was never even reached, so no per-class dispatch logic was ever
+           actually at fault.
 
-        Returning False here means server_args.py's own compatibility rule
-        ("OOT platform without piecewise support",
-         lambda: current_platform.is_out_of_tree()
-                 and not current_platform.support_piecewise_cuda_graph())
-        disables tc_piecewise automatically for this platform, and prefill
-        falls back to the plain eager path -- which fake_forward.py's
-        ModelRunner.forward hook, fake_attention.py's DummyNativeAttnBackend
-        hooks, and fake_quant.py's Fp8LinearMethod/Fp8MoEMethod hooks all
-        already handle correctly, with no dependency on Dynamo tracing or
-        CUDA graph capture at all.
+        2. Real torch.cuda.graph()-style CUDA graph capture, with no CPU
+           equivalent. Confirmed by reading CUDAPiecewiseBackend's real
+           source directly: torch.cuda.CUDAGraph() and the
+           torch.cuda.graph(...) context manager live ENTIRELY inside
+           CUDAPiecewiseBackend.__call__, and nothing outside that class --
+           not SGLangBackend, not TcPiecewiseCudaGraphBackend, not
+           PrefillCudaGraphRunner -- ever inspects a piecewise-backend
+           instance's internal capture state (ConcreteSizeEntry.cudagraph /
+           .output / .concrete_size_entries). The only contract any caller
+           relies on is "call this object with args, get back a
+           tensor/tuple matching shape/dtype". get_piecewise_backend_cls()
+           below already substitutes DummyPiecewiseBackend for the whole
+           class, so real capture is never faked -- it's bypassed by
+           construction, and confirmed safe to bypass.
+
+        The remaining CUDA-graph-adjacent primitives this path touches are
+        each already handled, for reasons that don't require faking real
+        driver behavior:
+          - device_module.graph_pool_handle() -- stubbed as a no-op on
+            torch.cpu by fake_graph_pool.py.
+          - the CUDA stream object threaded through capture_session() --
+            never dereferenced for real stream semantics once (2) above is
+            bypassed; any opaque handle satisfies the bookkeeping.
+          - set_graph_pool_id() (pynccl_allocator) -- a bare Python global
+            assignment, not a driver call; harmless on any device.
+          - self._device_module.synchronize() -- generic across
+            torch.get_device_module(), already a no-op on CPU.
+
+        Also confirmed: the OTHER server_args.py auto-disable rule for this
+        feature -- "non-CUDA hardware (HIP/NPU/CPU/MPS/XPU)" -- does not
+        fire for this platform either. That rule's is_cpu()
+        (sglang.srt.utils.common.is_cpu) is gated on the
+        SGLANG_USE_CPU_ENGINE=1 environment variable, not on host
+        architecture -- confirmed by reading the function directly. It
+        targets SGLang's own in-tree CPU engine, not an OOT platform that
+        happens to run on CPU hardware; this platform never sets that env
+        var, so is_hip()/is_npu()/is_cpu()/is_mps()/is_xpu() all evaluate
+        False here regardless of the real underlying device.
+
+        NOT resolved by this change -- deliberately out of scope here:
+        fake_attention.py's and fake_quant.py's hooks are plain Python
+        monkeypatches, not registered custom ops. A standalone Dynamo probe
+        already confirmed these break fullgraph=True tracing (install_
+        compile()'s hard requirement) rather than gracefully graph-breaking
+        around them. Returning True here makes tc_piecewise SELECTABLE
+        again and unblocks it at the platform-capability layer; it does
+        NOT by itself make a real forward pass through
+        Qwen3-Coder-480B-A35B trace successfully under fullgraph=True.
+        Expect a Dynamo trace-time failure at the first untraceable hook
+        until those are converted to register_custom_op-wrapped ops -- a
+        separate, larger piece of follow-up work, not bundled into this
+        change.
         """
-        return False
+        return True

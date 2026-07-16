@@ -37,6 +37,10 @@ dummy_attention = "dummy_srt_platform_plugin.fake_attention:register"
 dummy_quant = "dummy_srt_platform_plugin.fake_quant:register"
 dummy_graph_pool = "dummy_srt_platform_plugin.fake_graph_pool:register"
 dummy_support_triton = "dummy_srt_platform_plugin.fake_triton_support:register"
+dummy_embedding = "dummy_srt_platform_plugin.fake_embedding:register"
+dummy_rotary = "dummy_srt_platform_plugin.fake_rotary:register"
+dummy_unified_attention = "dummy_srt_platform_plugin.fake_unified_attention:register"
+
 
 [tool.setuptools]
 packages = {find = {where = ["src"]}}

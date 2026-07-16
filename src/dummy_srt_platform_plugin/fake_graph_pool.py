@@ -23,23 +23,27 @@ CUDA graph capture -- every piece stays meta-in/meta-out and the only real
 side effect is time.sleep() -- the VALUE returned by graph_pool_handle()
 is never meaningfully consumed for actual memory-pooling purposes on this
 platform; self._pool just needs to hold *something* so downstream
-attribute access doesn't fail. Returning None is intentionally the
-simplest possible stand-in.
+attribute access doesn't fail.
 
-VERIFY BEFORE RELYING ON THIS: whether self._pool (the attribute this
-sets) is used ANYWHERE ELSE in tc_piecewise_cuda_graph_backend.py besides
-being stored -- e.g. passed into a later torch.cuda.graph(pool=self._pool)
-call, which would ALSO need patching/faking for a CPU device, and which
-this plugin does not address. Run:
+CONFIRMED WRONG, via a real launch traceback: returning None is NOT a safe
+stand-in. get_or_create_global_graph_memory_pool() caches whatever this
+returns and threads it straight into
+install_torch_compiled()'s backend_factory, which constructs
+SGLangBackend(compile_config, graph_pool) -- and SGLangBackend.__init__
+(compilation/backend.py:387) unconditionally asserts
+`assert graph_pool is not None`. Returning None satisfies "give me
+something" for the missing-method crash but fails this separate assertion
+one call later:
 
-    import inspect
-    from sglang.srt.model_executor.runner_backend.tc_piecewise_cuda_graph_backend import (
-        TcPiecewiseCudaGraphBackend,
-    )
-    print(inspect.getsource(TcPiecewiseCudaGraphBackend))
+    AssertionError (compilation/backend.py:387, assert graph_pool is not None)
 
-and grep the output for every other use of `self._pool` before assuming
-this one-line patch is sufficient to get past compile-pass setup entirely.
+Fixed by returning a plain sentinel object instead -- anything that is not
+None satisfies the assert, and nothing downstream ever dereferences it for
+real CUDA-pool semantics: it's just stored as self.graph_pool and threaded
+through make_backend()/DummyPiecewiseBackend.__init__ as an opaque value,
+never read again (confirmed by grepping backend.py, tc_piecewise_cuda_
+graph_backend.py, and piecewise_backend.py for any other use of
+graph_pool/self._pool besides storage).
 
 pyproject.toml addition:
 
@@ -53,14 +57,21 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Fixed sentinel, not a fresh object() per call -- get_or_create_global_
+# graph_memory_pool() only calls graph_pool_handle() once and caches the
+# result (resources.graph_memory_pool), but returning the same sentinel
+# every call is one less thing to reason about if anything ever calls
+# this more than once, and is just as cheap.
+_POOL_SENTINEL = object()
+
 
 def register():
     """Entry point called by load_plugins()."""
     if not hasattr(torch.cpu, "graph_pool_handle"):
-        torch.cpu.graph_pool_handle = lambda: None
+        torch.cpu.graph_pool_handle = lambda: _POOL_SENTINEL
         logger.info(
             "dummy_graph_pool plugin registered (torch.cpu.graph_pool_handle "
-            "no-op added)"
+            "no-op added, returns a non-None sentinel)"
         )
     else:
         logger.info(
