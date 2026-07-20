@@ -17,8 +17,12 @@ class DummySRTPlatform(SRTPlatform, DummyDeviceMixin):
     """
     CPU-compatible dummy SRT platform.
 
-    Reuses existing SGLang CPU components (CPUGraphRunner, MHATokenToKVPool, etc.)
-    for a minimal, functional platform.
+    Reuses existing SGLang CPU components where they actually work
+    unmodified (MHATokenToKVPool's no-op sibling, NoOpMHATokenToKVPool,
+    etc.), and substitutes plugin-owned replacements where the real
+    component can't survive a meta-device model -- e.g.
+    DummyDecodeGraphRunner (fake_decode_graph.py) in place of the real
+    in-tree CPUGraphRunner; see get_graph_runner_cls()'s docstring for why.
     """
 
     def get_default_attention_backend(self) -> str:
@@ -50,10 +54,75 @@ class DummySRTPlatform(SRTPlatform, DummyDeviceMixin):
         return "dummy_native"
 
     def get_graph_runner_cls(self) -> type:
-        """Return the graph runner class for this platform."""
-        # Use existing CPU graph runner
-        from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
-        return CPUGraphRunner
+        """Return the graph runner class for this platform.
+
+        Returns DummyDecodeGraphRunner, NOT CPUGraphRunner -- confirmed via
+        a real-source investigation (bf231f01a3b3ae3a9c1dc942bb4c52343e81f26b,
+        sgl-project/sglang) that CPUGraphRunner cannot succeed against this
+        platform's meta-device model, and that this method is what actually
+        controls decode's graph runner regardless of support_cuda_graph()'s
+        value.
+
+        Two things confirmed that make this method (rather than
+        support_cuda_graph()) the real lever here:
+
+        1. support_cuda_graph() is barely consulted upstream -- only two
+           call sites (model_runner.py:918-924, 1814-1819), both OR'd with
+           a hardcoded `self.device in ("cuda", "musa", "cpu", "npu")`
+           check that already matches this platform's device_type="cpu"
+           regardless of that flag. init_decode_cuda_graph() is reached
+           either way.
+        2. Because this platform is OOT (_enum = PlatformEnum.OOT),
+           init_decode_cuda_graph() (model_runner.py:2575-2590) always
+           takes the `current_platform.get_graph_runner_cls()` branch, and
+           this method's return value is instantiated directly as
+           self.decode_cuda_graph_runner -- never the real
+           DecodeCudaGraphRunner / FullCudaGraphBackend path (real
+           torch.cuda.CUDAGraph()) genuine GPU deployments use. That path,
+           and its "no CPU equivalent for torch.cuda.graph()" problem, is
+           unreachable from this platform by construction -- irrelevant
+           here, not solved.
+
+        Why CPUGraphRunner (SGLang's own real, in-tree CPU decode
+        accelerator -- torch.compile-based, not CUDA-graph-based) doesn't
+        work here: confirmed against its real source
+        (cpu_graph_runner.py) that __init__ allocates REAL (non-meta)
+        static buffers on the real device (lines 632-649), then calls
+        capture() synchronously at startup, which calls
+        self.model_runner.model.forward(...) DIRECTLY -- bypassing
+        ModelRunner.forward / fake_forward.py's hook entirely -- eagerly,
+        with no Dynamo/FakeTensorMode involved. Real "cpu" tensors meeting
+        this platform's meta-device weights (fake_load.py) in an ordinary
+        eager op is a hard device-mismatch RuntimeError at server startup,
+        not a graceful degrade: unlike prefill's tc_piecewise pipeline
+        (piecewise_backend.py), which stays inside Dynamo's FakeTensorMode
+        the whole time, CPUGraphRunner's capture has no such symbolic
+        space to hide the meta/real mismatch in.
+
+        DummyDecodeGraphRunner (fake_decode_graph.py) instead does no real
+        capture at all -- structurally different from
+        DummyPiecewiseBackend by necessity, not choice: decode is one
+        monolithic, never-split call (confirmed true even for real GPU
+        deployments -- resolve_decode_backend() in real SGLang falls back
+        from Backend.TC_PIECEWISE to FullCudaGraphBackend with
+        "decode='tc_piecewise' is not yet implemented", so there is no FX
+        graph to walk for a roofline estimate the way piecewise_backend.py
+        does for prefill). Per batch-size bucket, it runs the real
+        (uncompiled) model forward once to measure real wall-clock
+        latency, then sleeps that cached latency and skips the real
+        forward on every subsequent call for that bucket -- eliminating
+        the real per-op eager dispatch overhead that both EagerRunner and
+        CPUGraphRunner would otherwise pay on every single decode token.
+        See fake_decode_graph.py's module docstring for the full chain of
+        reasoning, including why a cache-hit's return value is safe to
+        leave disposable (fake_forward.py's post-hook already overwrites
+        it) and the narrow, explicitly-scoped feature gaps (LoRA, PP,
+        speculative decoding, two-batch-overlap, encoder-decoder,
+        elastic-EP).
+        """
+        from dummy_srt_platform_plugin.fake_decode_graph import DummyDecodeGraphRunner
+        logger.info("DummySRTPlatform DummyDecodeGraphRunner enabled for decode graph runner")
+        return DummyDecodeGraphRunner
 
     def get_mha_kv_pool_cls(self) -> type:
         """Return the MHA KV pool class for this platform.
